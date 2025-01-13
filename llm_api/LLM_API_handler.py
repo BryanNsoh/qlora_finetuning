@@ -12,32 +12,30 @@ from typing import (
     Type,
     TypeVar,
     Union,
-    Literal,
     Generic,
 )
+
+from dotenv import load_dotenv
+# Load .env (override any pre-existing environment variables with what's in .env)
+load_dotenv(override=True)
 
 import logfire
 from aiolimiter import AsyncLimiter
 from pydantic import BaseModel, Field
 
-# Pydantic AI imports
+# Core Pydantic AI
 from pydantic_ai import Agent
-from pydantic_ai.models import Model, KnownModelName, infer_model
+from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.gemini import GeminiModel
+from pydantic_ai.models.vertexai import VertexAIModel
 from pydantic_ai.exceptions import UserError
 
-try:
-    # Anthropic is optional, so only import if available
-    from pydantic_ai.models.anthropic import AnthropicModel
-except ImportError:
-    # If anthropic isn't installed, we can handle that gracefully if needed.
-    AnthropicModel = None
-
-# Configure logfire for demonstration
+# Configure logfire (optional)
 logfire.configure(send_to_logfire="if-token-present")
 
 T = TypeVar("T", bound=BaseModel)
-ModelProvider = Literal["openai", "groq", "vertexai"]
 
 # ----------------------------------------------------------------------------
 # Response Models
@@ -89,47 +87,18 @@ class UnifiedResponse(BaseModel, Generic[T]):
     error: Optional[str] = None
     original_prompt: Optional[str] = None
 
-
 # ----------------------------------------------------------------------------
 # Handler Class
 # ----------------------------------------------------------------------------
 
 class UnifiedLLMHandler:
     """
-    A unified handler for processing single or multiple prompts with typed responses
-    and optional batch mode, supporting multiple LLM providers.
+    A unified handler for processing single or multiple prompts with typed responses,
+    optional batch mode, and multiple LLM providers.
 
-    Follows principles of clarity (KISS), DRY, single responsibility (each method
-    clearly handles one concern: single prompt, multiple prompts, or batch).
+    The user MUST pass provider: in the model string (e.g. 'openai:gpt-4'),
+    or we raise an error. This eliminates ambiguous model name guessing.
     """
-
-    # Known short-hands => provider. This is used if we have "gpt-4o" etc.
-    MODEL_PREFIXES = {
-        "gpt-4o": "openai",
-        "gpt-4o-mini": "openai",
-        "gpt-4-turbo": "openai",
-        "gpt-4": "openai",
-        "gpt-3.5-turbo": "openai",
-        "o1-preview": "openai",
-        "o1-mini": "openai",
-        "llama-3.1-70b-versatile": "groq",
-        "llama3-groq-70b-8192-tool-use-preview": "groq",
-        "llama-3.1-70b-specdec": "groq",
-        "llama-3.1-8b-instant": "groq",
-        "llama-3.2-1b-preview": "groq",
-        "llama-3.2-3b-preview": "groq",
-        "mixtral-8x7b-32768": "groq",
-        "gemma2-9b-it": "groq",
-        "gemma-7b-it": "groq",
-        # Models that have no default prefix
-        "gemini-1.5-flash": None,
-        "gemini-1.5-pro": None,
-        "gemini-1.0-pro": None,
-        "gemini-1.5-flash-8b": None,
-        "vertex-gemini-1.5-flash": "vertexai",
-        "vertex-gemini-1.5-pro": "vertexai",
-        "vertex-gemini-1.5-flash-8b": "vertexai",
-    }
 
     def __init__(
         self,
@@ -142,15 +111,14 @@ class UnifiedLLMHandler:
         gemini_api_key: Optional[str] = None,
     ):
         """
-        :param requests_per_minute: If specified, an AsyncLimiter is used to throttle requests.
-        :param batch_output_dir: Directory where batch output JSONL is saved.
-        :param openai_api_key: Optional explicit key for direct OpenAI usage.
-        :param openrouter_api_key: Optional explicit key for OpenRouter usage.
-        :param deepseek_api_key: Optional explicit key for DeepSeek usage.
-        :param anthropic_api_key: Optional explicit key for Anthropic usage.
+        :param requests_per_minute: If specified, uses an AsyncLimiter to throttle requests.
+        :param batch_output_dir: Directory for saving batch output JSONL.
+        :param openai_api_key: OpenAI API key override (falls back to OPENAI_API_KEY if None).
+        :param openrouter_api_key: OpenRouter API key override (falls back to OPENROUTER_API_KEY).
+        :param deepseek_api_key: DeepSeek API key override (falls back to DEEPSEEK_API_KEY).
+        :param anthropic_api_key: Anthropic API key override (falls back to ANTHROPIC_API_KEY).
+        :param gemini_api_key: Gemini (Generative Language API) key override (falls back to GEMINI_API_KEY).
         """
-        # DRY principle: store environment or user-provided keys
-        # If the user doesn't provide the key, fallback to env variable
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         self.openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
         self.deepseek_api_key = deepseek_api_key or os.getenv("DEEPSEEK_API_KEY")
@@ -163,103 +131,72 @@ class UnifiedLLMHandler:
         self.batch_output_dir = Path(batch_output_dir)
         self.batch_output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _map_short_model_name(self, model_name: str) -> str:
+    def _build_model_instance(self, model_str: str) -> Model:
         """
-        If the user-provided model doesn't contain a colon and is recognized in MODEL_PREFIXES,
-        add the prefix. For example, "gpt-4o-mini" => "openai:gpt-4o-mini".
-        Otherwise return as-is.
+        If model_str is not prefixed with a recognized provider, raise an error.
+        Otherwise, build and return the correct pydantic_ai model instance.
         """
-        if ":" in model_name:
-            return model_name
-        prefix = self.MODEL_PREFIXES.get(model_name)
-        return model_name if prefix is None else f"{prefix}:{model_name}"
+        # 1) Check prefix
+        if ":" not in model_str:
+            raise UserError(
+                "Model string must start with a recognized prefix, "
+                "e.g. 'openai:gpt-4', 'openrouter:anthropic/claude-3.5', "
+                "'deepseek:deepseek-chat', 'anthropic:claude-2', 'gemini:gemini-1.5-flash', "
+                "'vertexai:gemini-1.5-flash'."
+            )
 
-    def _build_model_instance(
-        self, full_model_str: str
-    ) -> Model:
-        """
-        Decide which provider to use based on `full_model_str` prefix.
-        Return a pydantic_ai Model instance.
+        provider, real_model_name = model_str.split(":", 1)
+        provider = provider.strip().lower()
+        real_model_name = real_model_name.strip()
 
-        Follows KISS for clarity: each prefix has a simple if/elif. 
-        DRY: we unify repeated logic for environment keys.
-        """
-        # Anthropic usage, e.g. "anthropic:claude-2"
-        if full_model_str.startswith("anthropic:"):
-            if AnthropicModel is None:
-                raise UserError(
-                    "AnthropicModel not available. Please install pydantic-ai with the `[anthropic]` extra."
-                )
-            real_model = full_model_str[len("anthropic:"):]
-            if not self.anthropic_api_key:
-                raise UserError(
-                    "No Anthropic API key found. Either set ANTHROPIC_API_KEY in .env or pass anthropic_api_key="
-                )
-            return AnthropicModel(real_model, api_key=self.anthropic_api_key)
+        # 2) Based on prefix, create instance
+        if provider == "openai":
+            if not self.openai_api_key:
+                raise UserError("No OpenAI API key set. Provide openai_api_key= or set OPENAI_API_KEY.")
+            return OpenAIModel(real_model_name, api_key=self.openai_api_key)
 
-        # OpenRouter usage, e.g. "openrouter:anthropic/claude-3.5-sonnet"
-        if full_model_str.startswith("openrouter:"):
-            real_model = full_model_str[len("openrouter:"):]
+        elif provider == "openrouter":
             if not self.openrouter_api_key:
-                raise UserError(
-                    "No OpenRouter API key found. Either set OPENROUTER_API_KEY in .env or pass openrouter_api_key="
-                )
+                raise UserError("No OpenRouter API key set. Provide openrouter_api_key= or set OPENROUTER_API_KEY.")
             return OpenAIModel(
-                real_model,
+                real_model_name,
                 base_url="https://openrouter.ai/api/v1",
                 api_key=self.openrouter_api_key,
             )
 
-        # DeepSeek usage, e.g. "deepseek:deepseek-chat"
-        if full_model_str.startswith("deepseek:"):
-            real_model = full_model_str[len("deepseek:"):]
+        elif provider == "deepseek":
             if not self.deepseek_api_key:
-                raise UserError(
-                    "No DeepSeek API key found. Either set DEEPSEEK_API_KEY in .env or pass deepseek_api_key="
-                )
+                raise UserError("No DeepSeek API key set. Provide deepseek_api_key= or set DEEPSEEK_API_KEY.")
             return OpenAIModel(
-                real_model,
+                real_model_name,
                 base_url="https://api.deepseek.com",
                 api_key=self.deepseek_api_key,
             )
-            
-        # Gemini usage, e.g. "gemini:gemini-1.5-pro"
-        if full_model_str.startswith("gemini:"):
-            real_model = full_model_str[len("gemini:"):]
+
+        elif provider == "anthropic":
+            if not self.anthropic_api_key:
+                raise UserError("No Anthropic API key set. Provide anthropic_api_key= or set ANTHROPIC_API_KEY.")
+            return AnthropicModel(real_model_name, api_key=self.anthropic_api_key)
+
+        elif provider == "gemini":
             if not self.gemini_api_key:
-                raise UserError(
-                    "No Gemini API key found. Either set GEMINI_API_KEY in .env or pass gemini_api_key="
-                )
-            return OpenAIModel(
-                real_model,
-                base_url="https://api.gemini.com",
-                api_key=self.gemini_api_key,
+                raise UserError("No Gemini API key set. Provide gemini_api_key= or set GEMINI_API_KEY.")
+            return GeminiModel(real_model_name, api_key=self.gemini_api_key)
+
+        elif provider == "vertexai":
+            # Typically uses GCP credentials automatically.
+            return VertexAIModel(real_model_name)
+
+        else:
+            raise UserError(
+                f"Unrecognized provider prefix: {provider}. "
+                f"Must be one of: openai, openrouter, deepseek, anthropic, gemini, vertexai."
             )
-
-        # Otherwise, handle as "normal" (including known 'openai:gpt-4o-mini', 'groq:...', 'vertexai:...', etc.)
-        # or let pydantic_ai.models.infer_model handle it.
-        # If it's an openai prefix, we use the openai_api_key if it's an OpenAIModel.
-        # Otherwise, let the relevant provider's environment usage happen under the hood.
-        if isinstance(full_model_str, (KnownModelName, str)):
-            # If "openai:" is detected, or user uses a name that leads to OpenAIModel, we pass openai_api_key if set.
-            # This is a fallback. We'll attempt to infer the model:
-            inst = infer_model(full_model_str)
-            if isinstance(inst, OpenAIModel) and self.openai_api_key:
-                # override the default if we have an explicit openai_api_key
-                inst.api_key = self.openai_api_key
-            return inst
-
-        # If it's already a pydantic_ai Model, just return it.
-        if isinstance(full_model_str, Model):
-            return full_model_str
-
-        # If none of the above, raise an error
-        raise UserError(f"Unrecognized model reference: {full_model_str}")
 
     async def process(
         self,
         prompts: Union[str, List[str]],
-        model: Union[str, KnownModelName, Model],
+        model: str,
         response_type: Type[T],
         *,
         system_message: Union[str, Sequence[str]] = (),
@@ -269,6 +206,14 @@ class UnifiedLLMHandler:
     ) -> UnifiedResponse[Union[T, List[T], BatchResult]]:
         """
         Main entry point for processing user prompts with typed responses.
+
+        :param prompts: The prompt or list of prompts.
+        :param model: Must be "provider:model_name", e.g. "openai:gpt-4".
+        :param response_type: A pydantic BaseModel for typed responses, e.g. SimpleResponse.
+        :param system_message: Optional system message(s) to guide the model.
+        :param batch_size: If multiple prompts are provided, process them in chunks.
+        :param batch_mode: If True, uses the OpenAI batch API (only for openai: models).
+        :param retries: Number of times to retry on certain exceptions.
         """
         with logfire.span("llm_processing"):
             original_prompt_for_error = None
@@ -283,20 +228,7 @@ class UnifiedLLMHandler:
                 if isinstance(prompts, list) and len(prompts) == 0:
                     raise UserError("Prompts list cannot be empty.")
 
-                # If user gave a raw string for the model, let's maybe add a prefix if needed.
-                if isinstance(model, str):
-                    # Potentially map short model names => "openai:gpt-4o-mini" etc.
-                    model_mapped = self._map_short_model_name(model)
-                    model_instance = self._build_model_instance(model_mapped)
-                elif isinstance(model, KnownModelName):
-                    # KnownModelName => pass to build
-                    model_instance = self._build_model_instance(model)
-                elif isinstance(model, Model):
-                    # Already a pydantic_ai model, just trust it
-                    model_instance = model
-                else:
-                    # Fallback: treat it as a string
-                    raise UserError(f"Invalid model parameter: {model}")
+                model_instance = self._build_model_instance(model)
 
                 agent = Agent(
                     model_instance,
@@ -306,14 +238,12 @@ class UnifiedLLMHandler:
                 )
 
                 if batch_mode:
-                    # Batch mode is only supported by OpenAI (OpenAIModel)
+                    # Only openai: supports batch API
                     if not isinstance(model_instance, OpenAIModel):
                         raise UserError(
-                            "Batch API mode is only supported for OpenAI models."
+                            "Batch API mode is only supported for openai:... models."
                         )
-                    batch_result = await self._process_batch(
-                        agent, prompts, response_type
-                    )
+                    batch_result = await self._process_batch(agent, prompts, response_type)
                     return UnifiedResponse(success=True, data=batch_result)
 
                 if isinstance(prompts, str):
@@ -326,9 +256,7 @@ class UnifiedLLMHandler:
             except UserError as e:
                 full_trace = traceback.format_exc()
                 error_msg = f"UserError: {e}\nFull Traceback:\n{full_trace}"
-                with logfire.span(
-                    "error_handling", error=str(e), error_type="user_error"
-                ):
+                with logfire.span("error_handling", error=str(e), error_type="user_error"):
                     return UnifiedResponse(
                         success=False,
                         error=error_msg,
@@ -337,9 +265,7 @@ class UnifiedLLMHandler:
             except Exception as e:
                 full_trace = traceback.format_exc()
                 error_msg = f"Unexpected error: {e}\nFull Traceback:\n{full_trace}"
-                with logfire.span(
-                    "error_handling", error=str(e), error_type="unexpected_error"
-                ):
+                with logfire.span("error_handling", error=str(e), error_type="unexpected_error"):
                     return UnifiedResponse(
                         success=False,
                         error=error_msg,
@@ -348,7 +274,7 @@ class UnifiedLLMHandler:
 
     async def _process_single(self, agent: Agent, prompt: str) -> T:
         """
-        Process a single prompt with optional rate limiting (KISS).
+        Process a single prompt with optional rate limiting.
         """
         with logfire.span("process_single"):
             if self.rate_limiter:
@@ -362,8 +288,7 @@ class UnifiedLLMHandler:
         self, agent: Agent, prompts: List[str], batch_size: int
     ) -> List[T]:
         """
-        Process multiple prompts, chunked by `batch_size` to avoid sending too large requests.
-        Uses asyncio.gather for parallelism (Single Responsibility).
+        Process multiple prompts in chunks (batch_size) using asyncio.gather for concurrency.
         """
         results = []
         with logfire.span("process_multiple"):
@@ -386,9 +311,9 @@ class UnifiedLLMHandler:
         self, agent: Agent, prompts: List[str], response_type: Type[T]
     ) -> BatchResult:
         """
-        Specialized method for the OpenAI Batch API workflow. Writes JSONL, uploads,
-        polls for completion, and returns a BatchResult with typed responses.
-        (Single Responsibility: only handles batch logic.)
+        Specialized method for the OpenAI Batch API workflow.
+        Writes JSONL, uploads to OpenAI, polls for completion,
+        and returns a BatchResult with typed responses.
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         batch_file = self.batch_output_dir / f"batch_{timestamp}.jsonl"
@@ -407,7 +332,6 @@ class UnifiedLLMHandler:
                     }
                     f.write(json.dumps(request) + "\n")
 
-            # This uses the OpenAI python client under the hood
             batch_upload = await agent.model.client.files.create(
                 file=batch_file.open("rb"), purpose="batch"
             )
@@ -443,10 +367,8 @@ class UnifiedLLMHandler:
             result_content = await agent.model.client.files.content(
                 status.output_file_id
             )
-
             with output_file.open("wb") as f:
                 f.write(result_content.content)
-
             metadata.output_file_path = str(output_file)
 
             results = []
@@ -454,9 +376,7 @@ class UnifiedLLMHandler:
                 for line, prompt in zip(f, prompts):
                     data = json.loads(line)
                     try:
-                        content = data["response"]["body"]["choices"][0]["message"][
-                            "content"
-                        ]
+                        content = data["response"]["body"]["choices"][0]["message"]["content"]
                         r = response_type.construct()
                         if "content" in response_type.model_fields:
                             setattr(r, "content", content)
@@ -465,9 +385,7 @@ class UnifiedLLMHandler:
                         results.append({"prompt": prompt, "response": r})
                     except Exception as e:
                         full_trace = traceback.format_exc()
-                        error_msg = (
-                            f"Unexpected error: {e}\nFull Traceback:\n{full_trace}"
-                        )
+                        error_msg = f"Unexpected error: {e}\nFull Traceback:\n{full_trace}"
                         results.append({"prompt": prompt, "error": error_msg})
 
             return BatchResult(metadata=metadata, results=results)
@@ -479,168 +397,129 @@ class UnifiedLLMHandler:
 
 async def run_tests():
     """
-    Demonstrates usage of UnifiedLLMHandler with single, multiple,
-    and batch prompts, plus usage of new model prefixes like openrouter:, deepseek:, etc.
-
-    PREREQUISITE:
-      - Ensure environment variables or constructor arguments are set for each provider you plan to use.
+    Demonstrates usage with single, multiple, and batch prompts,
+    for different providers. The user must pass "provider:model".
     """
-    # Example instantiation with explicit keys (any omitted keys fall back to environment)
     handler = UnifiedLLMHandler(
         requests_per_minute=2000,
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        gemini_api_key=os.getenv("GEMINI_API_KEY"),
     )
 
-    # Test 1: Single prompt
+    # Test 1: Single prompt (openai)
     single_result = await handler.process(
-        "Explain quantum computing in simple terms",
-        "gpt-4o-mini",  # normal usage => openai prefix
-        SimpleResponse,
+        prompts="Explain quantum computing in simple terms",
+        model="openai:gpt-3.5-turbo",
+        response_type=SimpleResponse,
     )
-    print("\nTest 1 (Single Prompt):")
+    print("\nTest 1 (Single Prompt, openai:gpt-3.5-turbo):")
     print("Success?", single_result.success)
-    print(
-        "Data:",
-        single_result.data.model_dump(mode="python")
-        if single_result.success and single_result.data
-        else single_result.error,
-    )
+    if single_result.success and single_result.data:
+        print("Data:", single_result.data.model_dump(mode="python"))
+    else:
+        print("Error:", single_result.error)
 
-    # Test 2: Multiple prompts
+    # Test 2: Multiple prompts (gemini)
     math_questions = ["What is 127+345?", "Calculate 15% of 2500", "What is sqrt(169)?"]
     multi_result = await handler.process(
-        math_questions,
-        "gemini-1.5-flash-8b",
-        MathResponse,
+        prompts=math_questions,
+        model="gemini:gemini-1.5-flash-8b",
+        response_type=MathResponse,
         system_message="You are a precise mathematical assistant. Always show your reasoning.",
     )
-    print("\nTest 2 (Multiple Prompts):")
+    print("\nTest 2 (Multiple Prompts, gemini:gemini-1.5-flash-8b):")
     print("Success?", multi_result.success)
     if multi_result.success and multi_result.data:
-        if isinstance(multi_result.data, list):
-            for d in multi_result.data:
-                print(d.model_dump(mode="python"))
-        else:
-            print(multi_result.data.model_dump(mode="python"))
+        for d in multi_result.data:
+            print(d.model_dump(mode="python"))
     else:
-        print(multi_result.error)
+        print("Error:", multi_result.error)
 
-    # Test 3: Parallel processing with multiple prompts
+    # Test 3: Parallel processing (openai)
     person_prompts = [
         "Describe a software engineer in Silicon Valley",
         "Describe a chef in a Michelin star restaurant",
     ]
     person_result = await handler.process(
-        person_prompts, "gpt-4o-mini", PersonResponse, batch_size=2
+        prompts=person_prompts,
+        model="openai:gpt-4o-mini",
+        response_type=PersonResponse,
+        batch_size=2,
     )
-    print("\nTest 3 (Parallel Processing):")
+    print("\nTest 3 (Parallel, openai:gpt-4o-mini):")
     print("Success?", person_result.success)
     if person_result.success and isinstance(person_result.data, list):
         for d in person_result.data:
             print(d.model_dump(mode="python"))
     else:
-        print(person_result.error)
+        print("Error:", person_result.error)
 
-    # Test 4: Batch API processing with invalid model
-    # (gemini-1.5-flash-8b is not an OpenAI model => error)
-    simple_prompts = [f"Write a short story about number {i}" for i in range(3)]
+    # Test 4: Batch mode (openai)
+    simple_prompts = [f"Write a short story about {i}" for i in range(3)]
     batch_result = await handler.process(
-        simple_prompts,
-        "gemini-1.5-flash-8b",
-        SimpleResponse,
+        prompts=simple_prompts,
+        model="openai:gpt-3.5-turbo",
+        response_type=SimpleResponse,
         batch_mode=True,
     )
-    print("\nTest 4 (Batch API with invalid model):")
+    print("\nTest 4 (Batch API, openai:gpt-3.5-turbo):")
     print("Success?", batch_result.success)
-    print(
-        "Output:",
-        batch_result.error
-        if not batch_result.success
-        else batch_result.data.model_dump(mode="python"),
-    )
+    if batch_result.success and batch_result.data:
+        print(batch_result.data.model_dump(mode="python"))
+    else:
+        print("Error:", batch_result.error)
 
-    # Test 5: Invalid model
+    # Test 5: Attempting batch mode with a non-OpenAI model => error
+    batch_result_wrong = await handler.process(
+        prompts=simple_prompts,
+        model="gemini:gemini-1.5-flash-8b",
+        response_type=SimpleResponse,
+        batch_mode=True,
+    )
+    print("\nTest 5 (Batch API with gemini => error):")
+    print("Success?", batch_result_wrong.success)
+    print("Error:", batch_result_wrong.error)
+
+    # Test 6: Invalid prefix => error
     invalid_model_result = await handler.process(
-        "Test prompt", "invalid-model", SimpleResponse
+        prompts="Test prompt", model="gpt-4o-mini", response_type=SimpleResponse
     )
-    print("\nTest 5 (Invalid Model):")
+    print("\nTest 6 (Invalid prefix => error):")
     print("Success?", invalid_model_result.success)
-    print(
-        "Output:",
-        invalid_model_result.error
-        if not invalid_model_result.success
-        else invalid_model_result.data.model_dump(mode="python"),
-    )
+    print("Error:", invalid_model_result.error)
 
-    # Test 6: Invalid prompt (None)
-    invalid_prompt_result = await handler.process(None, "gpt-4o-mini", SimpleResponse)
-    print("\nTest 6 (Invalid Prompt):")
-    print("Success?", invalid_prompt_result.success)
-    print(
-        "Output:",
-        invalid_prompt_result.error
-        if not invalid_prompt_result.success
-        else invalid_prompt_result.data.model_dump(mode="python"),
-    )
-
-    # Test 7: OpenRouter usage example
-    # e.g. "openrouter:anthropic/claude-3.5-sonnet"
-    # Note: Must have OPENROUTER_API_KEY or pass openrouter_api_key= in constructor
+    # Test 7: OpenRouter usage
     openrouter_result = await handler.process(
-        "Hello from OpenRouter! Please summarize the concept of Pydantic AI structured outputs.",
-        "openrouter:anthropic/claude-3.5-sonnet",
-        SimpleResponse,
+        prompts="Summarize the differences between YAGNI and KISS principles.",
+        model="openrouter:anthropic/claude-3.5-sonnet",
+        response_type=SimpleResponse,
     )
-    print("\nTest 7 (OpenRouter Usage):")
+    print("\nTest 7 (OpenRouter usage):")
     print("Success?", openrouter_result.success)
-    if openrouter_result.success and openrouter_result.data:
-        if isinstance(openrouter_result.data, SimpleResponse):
-            print(openrouter_result.data.model_dump(mode="python"))
-        else:
-            print(openrouter_result.data)
-    else:
-        print(openrouter_result.error)
+    print("Output:", openrouter_result.data if openrouter_result.success else openrouter_result.error)
 
-    # Test 8: DeepSeek usage example
-    # e.g. "deepseek:deepseek-chat"
-    # Note: Must have DEEPSEEK_API_KEY or pass deepseek_api_key= in constructor
+    # Test 8: DeepSeek usage
     deepseek_result = await handler.process(
-        "Hello from DeepSeek! Please list 3 unique features of your platform.",
-        "deepseek:deepseek-chat",
-        SimpleResponse,
+        prompts="Hello from DeepSeek! Tell me a fun fact about software engineering.",
+        model="deepseek:deepseek-chat",
+        response_type=SimpleResponse,
     )
-    print("\nTest 8 (DeepSeek Usage):")
+    print("\nTest 8 (DeepSeek usage):")
     print("Success?", deepseek_result.success)
-    if deepseek_result.success and deepseek_result.data:
-        if isinstance(deepseek_result.data, SimpleResponse):
-            print(deepseek_result.data.model_dump(mode="python"))
-        else:
-            print(deepseek_result.data)
-    else:
-        print(deepseek_result.error)
+    print("Output:", deepseek_result.data if deepseek_result.success else deepseek_result.error)
 
-    # Test 9: Anthropic usage example (Requires pydantic-ai[anthropic] installed)
-    # e.g. "anthropic:claude-2"
-    if AnthropicModel is not None:
-        anthro_result = await handler.process(
-            "Explain YAGNI principle in software development.",
-            "anthropic:claude-2",
-            SimpleResponse,
-        )
-        print("\nTest 9 (Anthropic Usage):")
-        print("Success?", anthro_result.success)
-        if anthro_result.success and anthro_result.data:
-            if isinstance(anthro_result.data, SimpleResponse):
-                print(anthro_result.data.model_dump(mode="python"))
-            else:
-                print(anthro_result.data)
-        else:
-            print(anthro_result.error)
-    else:
-        print("\nTest 9 (Anthropic Usage): Skipped because AnthropicModel not installed.")
+    # Test 9: Anthropic usage
+    anthro_result = await handler.process(
+        prompts="Explain the Single Responsibility Principle in detail.",
+        model="anthropic:claude-3-5-sonnet-20241022",
+        response_type=SimpleResponse,
+    )
+    print("\nTest 9 (Anthropic usage):")
+    print("Success?", anthro_result.success)
+    print("Output:", anthro_result.data if anthro_result.success else anthro_result.error)
 
 
 if __name__ == "__main__":
