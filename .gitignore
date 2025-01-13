@@ -1,0 +1,59 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+
+# Distribution / packaging
+.eggs/
+dist/
+build/
+sdist/
+*.egg-info/
+*.egg
+*.whl
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+my_env/ # Add any custom names used for virtual environments
+**/virtual_env/ # Any virtual env named virtual_env anywhere
+
+
+# Log and data files
+*.log
+*.csv
+*.jsonl
+*.json
+*.txt
+/data/ # If you have a dedicated data folder, exclude it.
+
+# Private files
+.env
+.venv_api_key # add all files with sensitive API keys
+secrets.json
+private.key
+config.ini
+.streamlit/ # streamlit auth files
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE specific files
+.idea/
+*.iml
+*.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Other
+*.swp
+*~
+# Temporary files
+*.tmp
