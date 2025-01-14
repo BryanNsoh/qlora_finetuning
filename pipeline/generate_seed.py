@@ -44,6 +44,8 @@ def build_seed_prompt(existing_scenarios_text: str) -> str:
       - The critical constraint is that the current seed be as different
         from all previous seeds as possible while still being plausible
         and realistic.
+        
+        now focus on males of all age ranges and dont neglect white people. this is america afterall and really be diverse. 
 
     Output must be STRICTLY one JSON object with the fields from SeedScenarioModel
     (no 'seed_id', no extra keys).

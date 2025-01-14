@@ -23,9 +23,9 @@ TRANSCRIPTS_FILE = DATA_DIR / "transcripts.jsonl"
 EXTRACTED_FILE = DATA_DIR / "extracted.jsonl"
 
 async def orchestrate_pipeline(
-    num_new_seeds: int = 5,
-    #model_name: str = "openai:gpt-4o-mini" 
-    model_name: str = "deepseek:deepseek-chat"
+    num_new_seeds: int = 100,
+    model_name: str = "openai:gpt-4o-mini" 
+    #model_name: str = "deepseek:deepseek-chat"
 ):
     """
     Orchestrates the pipeline:
