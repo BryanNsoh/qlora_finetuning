@@ -19,7 +19,7 @@ TRANSCRIPTS_FILE = DATA_DIR / "transcripts.jsonl"
 EXTRACTED_FILE = DATA_DIR / "extracted.jsonl"
 
 async def orchestrate_pipeline(
-    num_new_seeds: int = 10,
+    num_new_seeds: int = 2,
     model_name: str = "openai:gpt-4o-mini"
 ):
     """
