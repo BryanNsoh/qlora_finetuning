@@ -2,71 +2,82 @@
 
 import json
 import asyncio
-from typing import List, Dict
+from typing import List
+
+from pydantic import BaseModel, Field
 from llm_api.LLM_API_handler import UnifiedLLMHandler
+from schemas.seed_schema import SeedModel
 
-# --------------- PROMPT BUILDING ---------------
+class TranscriptModel(BaseModel):
+    seed_id: str = Field(..., description="Which seed this transcript belongs to.")
+    content: str = Field(..., description="The entire conversation text.")
 
-def build_transcript_prompt(seed_json_str: str) -> str:
+def build_transcript_prompt(seed_obj: SeedModel) -> str:
     """
-    Given a seed in JSON string form, generate a plausible US-based clinical conversation.
+    Show the schema for TranscriptModel but note that the LLM only needs 
+    to produce the 'content'; we will enforce seed_id ourselves.
     """
+    schema_str = json.dumps(TranscriptModel.model_json_schema(), indent=2)
+    seed_str = json.dumps(seed_obj.model_dump(), indent=2, ensure_ascii=False)
+
     return f"""
 <TRANSCRIPT_GENERATION_REQUEST>
-  <SEED_INFO>
-    {seed_json_str}
-  </SEED_INFO>
+  <SEED>
+{seed_str}
+  </SEED>
+  <SCHEMA>
+{schema_str}
+  </SCHEMA>
   <INSTRUCTIONS>
-    Create a fictional US-based clinical conversation between a patient and a doctor.
-    - Reflect 'doctor_specialty' and 'consultation_location' from the seed.
-    - Address the 'main_complaints' realistically.
-    - If 'ongoing_therapies' is not null, incorporate it if relevant.
-    - Mention or discuss possible medications/tests only if it fits the natural flow.
-    - 'next_steps_suggestions' can appear as instructions from the doctor.
-    - Keep the entire conversation in plain text, speaker-labeled: "PATIENT:", "DOCTOR:", etc.
-    - Aim for 8-20 total turns, not more than ~50 lines total.
-    - Integrate 'conversation_quirks' if present (e.g. caretaker, fear of meds).
-    - Must remain consistent with the seed. Avoid nonsense or contradictions.
+    We already have the seed_id = "{seed_obj.seed_id}", so do NOT generate an ID.
+    Return a JSON object with these two fields:
+      "seed_id": "{seed_obj.seed_id}"
+      "content": "the entire conversation as plain text"
+
+    The conversation:
+    - Reflect the scenario in the seed: doctor_specialty, consultation_location, main_complaints, etc.
+    - ~8-20 total turns, plain text labeled "PATIENT:" / "DOCTOR:".
+    - If "ongoing_therapies" is not null, mention it logically.
+    - Incorporate next_steps_suggestions as doctor's instructions.
+
+    Output strictly JSON with exactly seed_id and content (no additional keys).
   </INSTRUCTIONS>
 </TRANSCRIPT_GENERATION_REQUEST>
 """
 
-# --------------- LLM CALL ---------------
-
-async def create_transcript_from_seed(
-    seed: Dict,
-    model_name: str = "deepseek:deepseek-chat"
-) -> str:
+async def create_transcript_for_seed(
+    seed_obj: SeedModel,
+    model_name: str
+) -> TranscriptModel:
     """
-    Calls the LLM to generate a conversation transcript for a single seed.
-    Returns the transcript text.
+    Generate a transcript (TranscriptModel) for one seed.
     """
-    prompt = build_transcript_prompt(json.dumps(seed, ensure_ascii=False))
+    prompt = build_transcript_prompt(seed_obj)
     handler = UnifiedLLMHandler(requests_per_minute=600)
     response = await handler.process(
         prompts=prompt,
         model=model_name,
-        response_type=None  # We'll parse the raw text
+        response_type=TranscriptModel
     )
 
     if not response.success or not response.data:
         raise ValueError(f"LLM call failed: {response.error or 'No data returned'}")
 
-    return response.data.content.strip()
+    # Must match the seed_id we forced
+    transcript = response.data
+    if transcript.seed_id != seed_obj.seed_id:
+        raise ValueError(f"LLM returned unexpected seed_id: {transcript.seed_id}")
+    return transcript
 
-# --------------- BATCH GENERATION ---------------
-
-async def generate_transcripts(
-    seeds: List[dict],
-    model_name: str = "deepseek:deepseek-chat"
-) -> List[str]:
+async def generate_transcripts_for_new_seeds(
+    seeds_missing_transcripts: List[SeedModel],
+    model_name: str
+) -> List[TranscriptModel]:
     """
-    Generates transcripts for all seeds concurrently (up to concurrency limit).
-    Returns list of transcripts, preserving order with seeds.
+    Generate transcripts for seeds that do NOT have transcripts yet.
     """
     tasks = []
-    for seed in seeds:
-        tasks.append(create_transcript_from_seed(seed, model_name))
-
-    transcripts = await asyncio.gather(*tasks)
-    return transcripts
+    for s in seeds_missing_transcripts:
+        tasks.append(create_transcript_for_seed(s, model_name))
+    results = await asyncio.gather(*tasks)
+    return list(results)

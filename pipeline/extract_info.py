@@ -2,95 +2,85 @@
 
 import json
 import asyncio
-from typing import List, Tuple
-from schemas.extraction_schema import ExtractedDataModel
+from typing import List
+
 from llm_api.LLM_API_handler import UnifiedLLMHandler
+from pydantic import BaseModel, Field
+from schemas.extraction_schema import ExtractedDataModel
 
-# --------------- PROMPT BUILDING ---------------
+class ExtractionInput(BaseModel):
+    seed_id: str
+    transcript: str
 
-def build_extraction_prompt(transcript_text: str, seed_id: str) -> str:
+def build_extraction_prompt(input_obj: ExtractionInput) -> str:
     """
-    Creates an extraction prompt that instructs the LLM to parse the transcript
-    according to ExtractedDataModel fields.
+    Build a prompt instructing the LLM to parse the transcript
+    into the ExtractedDataModel. We embed the JSON schema.
     """
+    schema_str = json.dumps(ExtractedDataModel.model_json_schema(), indent=2)
+    input_json = json.dumps(input_obj.model_dump(), indent=2)
+
     return f"""
 <EXTRACTION_REQUEST>
-  <TRANSCRIPT_TEXT>
-    {transcript_text}
-  </TRANSCRIPT_TEXT>
+  <INPUT>
+{input_json}
+  </INPUT>
+  <SCHEMA>
+{schema_str}
+  </SCHEMA>
   <INSTRUCTIONS>
-    Return exactly 1 valid JSON object matching:
-    {{
-      "seed_id": "{seed_id}",
-      "primary_complaint": "... or null",
-      "diagnoses": [...],
-      "medications_discussed": [...],
-      "medication_instructions": [...],
-      "tests_discussed": [...],
-      "follow_up_instructions": [...],
-      "caregiver_involvement": "... or null",
-      "ongoing_therapies_discussed": "... or null"
-    }}
-
-    Guidance:
-    - Identify the main complaint from the transcript.
-    - If the doctor explicitly diagnoses or references conditions, list them in "diagnoses".
-    - Collect any medication names, instructions, or test recommendations.
-    - "caregiver_involvement" if a caretaker is present or mentioned.
-    - "ongoing_therapies_discussed" if the conversation addresses continuing therapy.
-    - Must be valid JSON with no extra keys or text. 
+    Output exactly one JSON object matching ExtractedDataModel, where:
+      "seed_id" = "{input_obj.seed_id}"
+    Parse the transcript text to fill out the other fields:
+      primary_complaint, diagnoses, medications_discussed, medication_instructions,
+      tests_discussed, follow_up_instructions, caregiver_involvement,
+      ongoing_therapies_discussed.
+    No extra keys.
   </INSTRUCTIONS>
 </EXTRACTION_REQUEST>
 """
 
-# --------------- LLM CALL ---------------
-
-async def extract_single_transcript(
+async def extract_single(
     seed_id: str,
-    transcript_text: str,
-    model_name: str = "deepseek:deepseek-chat"
-) -> dict:
+    transcript: str,
+    model_name: str
+) -> ExtractedDataModel:
     """
-    Calls the LLM to extract structured info from a single transcript.
-    Returns a validated dictionary according to ExtractedDataModel.
+    Return an ExtractedDataModel parsed from the transcript.
     """
-    prompt = build_extraction_prompt(transcript_text, seed_id)
+    input_obj = ExtractionInput(seed_id=seed_id, transcript=transcript)
+    prompt = build_extraction_prompt(input_obj)
+
     handler = UnifiedLLMHandler(requests_per_minute=600)
     response = await handler.process(
         prompts=prompt,
         model=model_name,
-        response_type=None
+        response_type=ExtractedDataModel
     )
 
     if not response.success or not response.data:
-        raise ValueError(f"LLM extraction call failed: {response.error or 'No data returned'}")
+        raise ValueError(f"Extraction LLM call failed: {response.error or 'No data returned'}")
+    extracted = response.data
 
-    raw_text = response.data.content
-    try:
-        extracted_dict = json.loads(raw_text)
-        # Validate with ExtractedDataModel
-        validated = ExtractedDataModel(**extracted_dict)
-        return validated.dict()
-    except Exception as e:
-        raise ValueError(f"Parsing or validation error for extracted info: {e}")
+    # Check the seed_id
+    if extracted.seed_id != seed_id:
+        raise ValueError(f"Expected seed_id={seed_id}, got {extracted.seed_id} from LLM")
 
-# --------------- BATCH EXTRACTION ---------------
+    return extracted
 
-async def extract_info_from_transcripts(
-    seed_ids: List[str],
-    transcripts: List[str],
-    model_name: str = "deepseek:deepseek-chat"
-) -> List[dict]:
+async def extract_info_for_new_transcripts(
+    transcripts_data: List[dict],
+    model_name: str
+) -> List[ExtractedDataModel]:
     """
-    Extracts structured info from multiple transcripts concurrently.
-    Must match order of seed_ids and transcripts.
+    transcripts_data: a list of dicts like {'seed_id': 'seed-0001', 'transcript': '...'}
+    Returns: list of ExtractedDataModel for those that lack extraction.
     """
-    if len(seed_ids) != len(transcripts):
-        raise ValueError("Mismatched lengths for seed_ids and transcripts.")
-
     tasks = []
-    for sid, txt in zip(seed_ids, transcripts):
-        tasks.append(extract_single_transcript(sid, txt, model_name))
+    for tdata in transcripts_data:
+        sid = tdata["seed_id"]
+        txt = tdata["transcript"]
+        tasks.append(extract_single(sid, txt, model_name))
 
-    extracted_list = await asyncio.gather(*tasks)
-    return extracted_list
+    results = await asyncio.gather(*tasks)
+    return list(results)
