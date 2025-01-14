@@ -48,7 +48,7 @@ def build_transcript_prompt(seed_obj: SeedModel) -> str:
 
     Aim for a natural multi-turn dialogue (e.g. 8-20 turns).
     Label speakers as "PATIENT:" or "DOCTOR:" consistently, 
-    plus extra participants if relevant.
+    plus extra participants if relevant. Begin the dialogue with either the patient or the doctor.
     Keep it realistic and consistent with the scenario.
   </INSTRUCTIONS>
 </TRANSCRIPT_GENERATION_REQUEST>

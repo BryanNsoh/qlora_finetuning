@@ -26,6 +26,9 @@ def build_seed_prompt(existing_scenarios_text: str) -> str:
     Generate exactly ONE new scenario in JSON that fits SeedScenarioModel.
     (Do NOT include 'seed_id'.)
     
+    Begin with a reflection on what scenarios, demographics or contexts are already present in the current set. 
+    Then delibrerate on how to generate a new seed that is different from the existing ones while remaining realistic for a US-based clinical setting.
+    
     Requirements:
       - Must be a plausible, US-based clinical scenario.
       - conversation_length_minutes: an integer 3–15.
@@ -34,7 +37,8 @@ def build_seed_prompt(existing_scenarios_text: str) -> str:
       - Strive for diversity: vary patient backgrounds, complaints, or contexts not yet used.
       - Add creative touches (e.g. caretaker presence, or unique socio-cultural nuances)
         while remaining grounded and realistic.
-
+      - The critical constraint is that the current seed be as different from all previous seeds as possible while still being palusible and realistic
+    
     Output must be STRICTLY one JSON object with the fields from SeedScenarioModel 
     (no 'seed_id', no extra keys).
   </INSTRUCTIONS>

@@ -5,12 +5,16 @@ import json
 from pathlib import Path
 from typing import List, Dict
 
+# Our schemas
 from schemas.seed_schema import SeedModel
-from pipeline.generate_seed import generate_seeds
-from pipeline.generate_transcript import generate_transcripts_for_new_seeds, TranscriptModel
-from pipeline.extract_info import extract_info_for_new_transcripts
 from schemas.extraction_schema import ExtractedDataModel
 
+# Our pipeline steps
+from pipeline.generate_seed import generate_seeds
+from pipeline.generate_transcript import generate_transcripts_for_new_seeds
+from pipeline.extract_info import extract_info_for_new_transcripts
+
+# Data directory and files
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -19,40 +23,47 @@ TRANSCRIPTS_FILE = DATA_DIR / "transcripts.jsonl"
 EXTRACTED_FILE = DATA_DIR / "extracted.jsonl"
 
 async def orchestrate_pipeline(
-    num_new_seeds: int = 2,
-    model_name: str = "openai:gpt-4o-mini"
+    num_new_seeds: int = 5,
+    model_name: str = "openai:gpt-4o-mini" #str = "deepseek:deepseek-chat"
 ):
     """
-    1) Load existing seeds from seeds.jsonl.
-    2) Generate num_new_seeds more, append them to seeds.jsonl.
-    3) Identify seeds that have no transcript, generate transcripts for them, append to transcripts.jsonl.
-    4) Identify transcripts that have no extraction, extract them, append to extracted.jsonl.
+    Orchestrates the pipeline:
+      1) Load existing seeds from seeds.jsonl
+      2) Generate `num_new_seeds` new seeds (with automatic seed_id assignment),
+         appending them to seeds.jsonl
+      3) Generate transcripts only for seeds that don't have any, append to transcripts.jsonl
+      4) Extract data only for transcripts that don't have any extraction, append to extracted.jsonl
+
+    If you want a fresh run, delete these files:
+      - seeds.jsonl
+      - transcripts.jsonl
+      - extracted.jsonl
     """
 
-    # ---- 1) LOAD EXISTING SEEDS ----
+    # --- Step 1: Load existing seeds ---
     existing_seeds: List[SeedModel] = []
     if SEEDS_FILE.exists():
         with SEEDS_FILE.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    data = json.loads(line)
-                    seed_obj = SeedModel(**data)
-                    existing_seeds.append(seed_obj)
+                    seed_data = json.loads(line)
+                    existing_seeds.append(SeedModel(**seed_data))
 
-    # ---- 2) GENERATE N NEW SEEDS & SAVE ----
-    print(f"Generating {num_new_seeds} new seeds with {model_name}...")
+    # --- Step 2: Generate new seeds & append to seeds.jsonl ---
     new_seeds: List[SeedModel] = []
     if num_new_seeds > 0:
+        print(f"Generating {num_new_seeds} new seed(s) with model={model_name}...")
         new_seeds = await generate_seeds(num_new_seeds, model_name, existing_seeds)
-        # Append them to seeds.jsonl
-        with SEEDS_FILE.open("a", encoding="utf-8") as f:
-            for s in new_seeds:
-                f.write(json.dumps(s.model_dump()) + "\n")
 
+        with SEEDS_FILE.open("a", encoding="utf-8") as f:
+            for seed in new_seeds:
+                f.write(json.dumps(seed.model_dump()) + "\n")
+
+    # Combine in-memory
     all_seeds = existing_seeds + new_seeds
 
-    # ---- 3) GENERATE TRANSCRIPTS FOR SEEDS THAT DON'T HAVE ONE ----
+    # --- Step 3: Generate transcripts for seeds missing them ---
     existing_transcripts = []
     if TRANSCRIPTS_FILE.exists():
         with TRANSCRIPTS_FILE.open("r", encoding="utf-8") as f:
@@ -60,78 +71,71 @@ async def orchestrate_pipeline(
                 line = line.strip()
                 if line:
                     existing_transcripts.append(json.loads(line))
-                    # format: {"seed_id": <>, "transcript": <>}
+                    # Each entry: {"seed_id": "...", "transcript": "..."}
 
-    existing_seed_ids_with_transcripts = {item["seed_id"] for item in existing_transcripts}
-
-    # any seeds missing transcripts?
-    seeds_missing_transcripts = []
-    for s in all_seeds:
-        if s.seed_id not in existing_seed_ids_with_transcripts:
-            seeds_missing_transcripts.append(s)
+    seeds_with_transcripts = {t["seed_id"] for t in existing_transcripts}
+    seeds_missing_transcripts = [s for s in all_seeds if s.seed_id not in seeds_with_transcripts]
 
     if seeds_missing_transcripts:
-        print(f"Generating transcripts for {len(seeds_missing_transcripts)} seeds without transcripts...")
-        new_transcripts_models = await generate_transcripts_for_new_seeds(seeds_missing_transcripts, model_name)
-        # Append them to transcripts.jsonl
+        print(f"Generating transcripts for {len(seeds_missing_transcripts)} seed(s)...")
+        new_transcripts_data = await generate_transcripts_for_new_seeds(
+            seeds_missing_transcripts,
+            model_name
+        )
+        # new_transcripts_data is a list of dicts: {"seed_id":..., "transcript":...}
         with TRANSCRIPTS_FILE.open("a", encoding="utf-8") as f:
-            for tm in new_transcripts_models:
-                data_to_write = {
-                    "seed_id": tm.seed_id,
-                    "transcript": tm.content
-                }
-                f.write(json.dumps(data_to_write) + "\n")
+            for record in new_transcripts_data:
+                f.write(json.dumps(record) + "\n")
     else:
-        print("No seeds are missing transcripts.")
+        print("No seeds are missing transcripts. Skipping transcript generation.")
 
-    # ---- 4) EXTRACT INFO FOR TRANSCRIPTS THAT DON'T HAVE EXTRACTION ----
-    existing_extracted = []
+    # --- Step 4: Extract data for transcripts missing extraction ---
+    existing_extractions = []
     if EXTRACTED_FILE.exists():
         with EXTRACTED_FILE.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    existing_extracted.append(json.loads(line))
-                    # format matches ExtractedDataModel
+                    existing_extractions.append(json.loads(line))
+                    # Format: matches ExtractedDataModel fields
 
-    existing_seed_ids_with_extraction = {item["seed_id"] for item in existing_extracted}
+    seeds_with_extractions = {e["seed_id"] for e in existing_extractions}
 
-    # Let's rebuild a map seed_id -> transcript text
-    all_transcripts_map = {}
+    # Reload transcripts so we have them all
+    all_transcripts = []
     if TRANSCRIPTS_FILE.exists():
         with TRANSCRIPTS_FILE.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    rec = json.loads(line)
-                    sid = rec["seed_id"]
-                    txt = rec["transcript"]
-                    all_transcripts_map[sid] = txt
+                    all_transcripts.append(json.loads(line))
 
-    transcripts_for_extraction = []
-    for sid, txt in all_transcripts_map.items():
-        if sid not in existing_seed_ids_with_extraction:
-            # we need extraction for this transcript
-            transcripts_for_extraction.append({"seed_id": sid, "transcript": txt})
+    transcripts_missing_extraction = [
+        t for t in all_transcripts if t["seed_id"] not in seeds_with_extractions
+    ]
 
-    if transcripts_for_extraction:
-        print(f"Extracting info for {len(transcripts_for_extraction)} transcripts with no extraction...")
-        new_extractions = await extract_info_for_new_transcripts(transcripts_for_extraction, model_name)
-        # Append them to extracted.jsonl
+    if transcripts_missing_extraction:
+        print(f"Extracting data for {len(transcripts_missing_extraction)} transcript(s)...")
+        new_extractions = await extract_info_for_new_transcripts(
+            transcripts_missing_extraction,
+            model_name
+        )
+        # new_extractions is a list of ExtractedDataModel
         with EXTRACTED_FILE.open("a", encoding="utf-8") as f:
-            for eobj in new_extractions:
-                f.write(json.dumps(eobj.model_dump()) + "\n")
+            for extraction in new_extractions:
+                f.write(json.dumps(extraction.model_dump()) + "\n")
     else:
-        print("No transcripts are missing extraction.")
+        print("No transcripts are missing extraction. Skipping extraction step.")
 
-    print("Pipeline complete!\n"
-          f"Seeds total: {len(all_seeds)}\n"
-          f"Transcripts total: {len(all_transcripts_map)}\n"
-          f"Extractions total: {len(existing_extracted) + (len(transcripts_for_extraction) if transcripts_for_extraction else 0)}")
+    # --- Done ---
+    print("\n--- Pipeline Complete ---")
+    print(f"  Seeds total:        {len(all_seeds)}")
+    print(f"  Transcripts total:  {len(all_transcripts)}")
+    print(f"  Extractions total:  {len(existing_extractions) + len(transcripts_missing_extraction)}")
 
 def main():
-    # Example usage: generate 2 new seeds each run
-    asyncio.run(orchestrate_pipeline(num_new_seeds=2))
+    # Example: generate 3 new seeds on each run
+    asyncio.run(orchestrate_pipeline(num_new_seeds=3))
 
 if __name__ == "__main__":
     main()
